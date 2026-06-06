@@ -1,0 +1,3 @@
+flask
+hyperliquid-python-sdk
+eth-account

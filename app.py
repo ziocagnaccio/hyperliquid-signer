@@ -6,6 +6,8 @@ import json
 
 app = Flask(__name__)
 
+MAIN_WALLET = "0x39766bC02d31134a16F0F66d000B47FAD9398e75"
+
 @app.route('/place-order', methods=['POST'])
 def place_order():
     try:
@@ -18,7 +20,11 @@ def place_order():
         sl_price = float(data['slPrice'])
 
         account = eth_account.Account.from_key(private_key)
-        exchange = Exchange(account, constants.MAINNET_API_URL)
+        exchange = Exchange(
+            account, 
+            constants.MAINNET_API_URL,
+            account_address=MAIN_WALLET
+        )
 
         order = exchange.order(
             "BTC",

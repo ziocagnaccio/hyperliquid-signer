@@ -1,10 +1,9 @@
 """
 ETH 15m Scalping Bot — Hyperliquid
 Stack: TradingView → n8n → this app → Hyperliquid
-Leverage: 5x | Capital: $1000 | Both LONG & SHORT
+Leverage: 7x | Capital: $500 | Both LONG & SHORT
 Orders: LIMIT (maker fee 0.02% vs taker 0.05%) — 60% cheaper
 """
-
 import os
 import json
 import hmac

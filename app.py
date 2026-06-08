@@ -28,8 +28,8 @@ HL_BASE_URL      = "https://api.hyperliquid.xyz"
 SYMBOL           = "ETH"
 LEVERAGE         = 7
 CAPITAL          = 500.0
-RISK_PCT         = 0.15       # 15% of $500 capital = $75 per trade
-LIMIT_OFFSET_PCT = 0.001       # 0.1% offset for maker fee
+RISK_PCT         = 0.15
+LIMIT_OFFSET_PCT = 0.001
 FILL_TIMEOUT_SEC = 30
 
 
@@ -45,20 +45,37 @@ def sign_request(secret, data):
     return hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
 
 
+def safe_post(url, payload, headers=None):
+    """Safe POST — always returns dict, never crashes on bad JSON."""
+    try:
+        if headers:
+            resp = requests.post(url, json=payload, headers=headers, timeout=10)
+        else:
+            resp = requests.post(url, json=payload, timeout=10)
+        print(f"[HTTP] {url} -> status {resp.status_code}")
+        print(f"[HTTP] raw response: {resp.text[:500]}")
+        try:
+            return resp.json()
+        except Exception:
+            print(f"[ERROR] Could not parse JSON from response: {resp.text[:300]}")
+            return {"error": "invalid_json", "raw": resp.text[:300]}
+    except Exception as e:
+        print(f"[ERROR] Request failed: {str(e)}")
+        return {"error": str(e)}
+
+
 def get_eth_price():
-    resp = requests.post(f"{HL_BASE_URL}/info", json={"type": "allMids"})
-    mids = resp.json()
-    return float(mids.get("ETH", 0))
+    result = safe_post(f"{HL_BASE_URL}/info", {"type": "allMids"})
+    return float(result.get("ETH", 0))
 
 
 def get_open_position():
-    payload = {
-        "type": "clearinghouseState",
-        "user": HL_WALLET_ADDR
-    }
-    resp = requests.post(f"{HL_BASE_URL}/info", json=payload)
-    data = resp.json()
-    positions = data.get("assetPositions", [])
+    payload = {"type": "clearinghouseState", "user": HL_WALLET_ADDR}
+    result = safe_post(f"{HL_BASE_URL}/info", payload)
+    if "error" in result:
+        print(f"[ERROR] get_open_position failed: {result}")
+        return None
+    positions = result.get("assetPositions", [])
     for p in positions:
         pos = p.get("position", {})
         if pos.get("coin") == SYMBOL:
@@ -73,12 +90,8 @@ def get_open_position():
 
 
 def get_open_orders():
-    payload = {
-        "type": "openOrders",
-        "user": HL_WALLET_ADDR
-    }
-    resp = requests.post(f"{HL_BASE_URL}/info", json=payload)
-    return resp.json()
+    payload = {"type": "openOrders", "user": HL_WALLET_ADDR}
+    return safe_post(f"{HL_BASE_URL}/info", payload)
 
 
 def cancel_order(order_id):
@@ -86,16 +99,14 @@ def cancel_order(order_id):
     payload = {
         "action": {
             "type": "cancel",
-            "cancels": [
-                {"a": 4, "o": order_id}
-            ]
+            "cancels": [{"a": 4, "o": order_id}]
         },
         "nonce": timestamp,
         "signature": sign_request(HL_API_SECRET, {"nonce": timestamp})
     }
     headers = {"Content-Type": "application/json", "HL-API-KEY": HL_API_KEY}
-    resp = requests.post(f"{HL_BASE_URL}/exchange", json=payload, headers=headers)
-    print(f"[CANCEL] Order {order_id} | Response: {resp.json()}")
+    result = safe_post(f"{HL_BASE_URL}/exchange", payload, headers)
+    print(f"[CANCEL] Order {order_id} | Response: {result}")
 
 
 def set_leverage():
@@ -112,8 +123,9 @@ def set_leverage():
         "signature": sign_request(HL_API_SECRET, {"nonce": timestamp})
     }
     headers = {"Content-Type": "application/json", "HL-API-KEY": HL_API_KEY}
-    resp = requests.post(f"{HL_BASE_URL}/exchange", json=payload, headers=headers)
-    print(f"[LEVERAGE] Set to {LEVERAGE}x | Response: {resp.json()}")
+    result = safe_post(f"{HL_BASE_URL}/exchange", payload, headers)
+    print(f"[LEVERAGE] Set to {LEVERAGE}x | Response: {result}")
+    return result
 
 
 def place_sl_tp(is_buy, size, sl, tp, nonce):
@@ -155,8 +167,8 @@ def place_sl_tp(is_buy, size, sl, tp, nonce):
         "signature": sign_request(HL_API_SECRET, {"nonce": nonce})
     }
     headers = {"Content-Type": "application/json", "HL-API-KEY": HL_API_KEY}
-    resp = requests.post(f"{HL_BASE_URL}/exchange", json=payload, headers=headers)
-    print(f"[SL/TP] SL=${sl} TP=${tp} | Response: {resp.json()}")
+    result = safe_post(f"{HL_BASE_URL}/exchange", payload, headers)
+    print(f"[SL/TP] SL=${sl} TP=${tp} | Response: {result}")
 
 
 def place_limit_order(side, size_usd, signal_price, sl, tp):
@@ -168,9 +180,11 @@ def place_limit_order(side, size_usd, signal_price, sl, tp):
     else:
         limit_price = round(signal_price * (1 + LIMIT_OFFSET_PCT), 2)
 
-    print(f"[LIMIT ORDER] {side} {eth_size} ETH @ ${limit_price} (signal was ${signal_price})")
+    print(f"[LIMIT ORDER] {side} {eth_size} ETH @ ${limit_price}")
 
-    set_leverage()
+    lev_result = set_leverage()
+    if "error" in lev_result:
+        print(f"[WARNING] Leverage set failed but continuing: {lev_result}")
     time.sleep(0.5)
 
     timestamp = get_timestamp()
@@ -180,11 +194,7 @@ def place_limit_order(side, size_usd, signal_price, sl, tp):
         "p": str(limit_price),
         "s": str(eth_size),
         "r": False,
-        "t": {
-            "limit": {
-                "tif": "Gtc"
-            }
-        }
+        "t": {"limit": {"tif": "Gtc"}}
     }
     payload = {
         "action": {
@@ -196,21 +206,23 @@ def place_limit_order(side, size_usd, signal_price, sl, tp):
         "signature": sign_request(HL_API_SECRET, {"nonce": timestamp})
     }
     headers = {"Content-Type": "application/json", "HL-API-KEY": HL_API_KEY}
-    resp = requests.post(f"{HL_BASE_URL}/exchange", json=payload, headers=headers)
-    result = resp.json()
+    result = safe_post(f"{HL_BASE_URL}/exchange", payload, headers)
     print(f"[ORDER PLACED] {result}")
 
     if result.get("status") != "ok":
-        return {"success": False, "result": result, "reason": "Order placement failed"}
+        return {
+            "success": False,
+            "result": result,
+            "reason": f"Order failed: {result}"
+        }
 
     order_id = None
     try:
         order_id = result["response"]["data"]["statuses"][0]["resting"]["oid"]
-        print(f"[ORDER ID] {order_id} — waiting up to {FILL_TIMEOUT_SEC}s for fill...")
+        print(f"[ORDER ID] {order_id} — waiting up to {FILL_TIMEOUT_SEC}s...")
     except (KeyError, IndexError):
         print("[WARNING] Could not extract order ID")
 
-    # Wait for fill
     filled = False
     waited = 0
     check_interval = 3
@@ -228,7 +240,6 @@ def place_limit_order(side, size_usd, signal_price, sl, tp):
     if not filled:
         if order_id:
             cancel_order(order_id)
-        print(f"[TIMEOUT] Not filled in {FILL_TIMEOUT_SEC}s — cancelled")
         return {
             "success": False,
             "result": result,
@@ -257,11 +268,7 @@ def close_position(side, size):
         "p": "0",
         "s": str(size),
         "r": True,
-        "t": {
-            "limit": {
-                "tif": "Ioc"
-            }
-        }
+        "t": {"limit": {"tif": "Ioc"}}
     }
     payload = {
         "action": {
@@ -273,8 +280,8 @@ def close_position(side, size):
         "signature": sign_request(HL_API_SECRET, {"nonce": timestamp})
     }
     headers = {"Content-Type": "application/json", "HL-API-KEY": HL_API_KEY}
-    resp = requests.post(f"{HL_BASE_URL}/exchange", json=payload, headers=headers)
-    print(f"[CLOSE] {side} closed | Response: {resp.json()}")
+    result = safe_post(f"{HL_BASE_URL}/exchange", payload, headers)
+    print(f"[CLOSE] {side} closed | Response: {result}")
 
 
 # ---------------------------------------------
@@ -321,7 +328,7 @@ def webhook():
             "existing": existing
         }), 200
 
-    position_usd = CAPITAL * RISK_PCT  # $37.50
+    position_usd = CAPITAL * RISK_PCT
     print(f"[EXECUTING] {side} ${position_usd} x {LEVERAGE}x = ${position_usd * LEVERAGE} exposure")
 
     result = place_limit_order(side, position_usd, price, sl, tp)

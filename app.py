@@ -1,399 +1,227 @@
 """
-ETH 15m Scalping Bot — Hyperliquid
-Stack: TradingView -> n8n -> this app -> Hyperliquid
-Leverage: 7x | Capital: $500 | Both LONG & SHORT
-Orders: LIMIT (maker fee 0.02% vs taker 0.05%) -- 60% cheaper
+AI Trend Bot — Hyperliquid (BTC / ETH / SOL)
+Flow:  TradingView (1H indicators) -> n8n -> THIS app -> Hyperliquid
+                                                 \-> Claude rates it -> Telegram
+
+What this app does:
+  1. Receives the indicators from TradingView (via n8n).
+  2. Decides LONG / SHORT / NOTHING  (volatility-gated "indicators vote").
+  3. Sizes the position off your LIVE account value:
+        collateral = POSITION_PCT * min(current_equity, INITIAL_CAPITAL)
+        -> shrinks when you're losing, never grows past the start when winning.
+  4. Refuses to open a 2nd position on a coin you're already in.
+  5. Places a 10x isolated order with TP 3% / SL 4%.
+
+Auth: uses the official hyperliquid-python-sdk (correct EIP-712 wallet signing).
 """
 
 import os
-import json
-import hmac
-import hashlib
-import time
-import requests
-from flask import Flask, request, jsonify
+import math
 from datetime import datetime
+
+from flask import Flask, request, jsonify
+from eth_account import Account
+from hyperliquid.info import Info
+from hyperliquid.exchange import Exchange
+from hyperliquid.utils import constants
 
 app = Flask(__name__)
 
-# ---------------------------------------------
-# CONFIG
-# ---------------------------------------------
-HL_API_KEY       = os.environ.get("HL_API_KEY")
-HL_API_SECRET    = os.environ.get("HL_API_SECRET")
-HL_WALLET_ADDR   = os.environ.get("HL_WALLET_ADDR")
-WEBHOOK_SECRET   = os.environ.get("WEBHOOK_SECRET", "your_webhook_secret")
+# ========================= CONFIG — edit these =========================
+INITIAL_CAPITAL = 2000.0          # your starting budget, in USD
+POSITION_PCT    = 0.15            # collateral per trade = 15% of (capped) equity
+LEVERAGE        = 10              # 10x
+TP_PCT          = 0.03            # take profit at +3%
+SL_PCT          = 0.04            # stop loss at -4%
+COINS           = ["BTC", "ETH", "SOL"]
+VOL_LIMITS      = {"BTC": 1.3, "ETH": 1.6, "SOL": 2.0}   # skip if atr_pct above this
+SCORE_TO_TRADE  = 3              # need 3 of 5 votes (raise to 4 = stricter)
+SLIPPAGE        = 0.01           # max 1% slippage on the market entry
+# =======================================================================
 
-HL_BASE_URL      = "https://api.hyperliquid.xyz"
-SYMBOL           = "ETH"
-LEVERAGE         = 7
-CAPITAL          = 500.0
-RISK_PCT         = 0.15
-LIMIT_OFFSET_PCT = 0.001
-FILL_TIMEOUT_SEC = 30
+# These come from Render Environment Variables — NEVER put real keys in this file.
+WALLET_KEY     = os.environ["HL_PRIVATE_KEY"]   # API/agent wallet private key
+MAIN_ADDR      = os.environ["HL_WALLET_ADDR"]   # your main account address (0x...)
+WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 
-
-# ---------------------------------------------
-# HELPERS
-# ---------------------------------------------
-def get_timestamp():
-    return int(time.time() * 1000)
+_wallet  = Account.from_key(WALLET_KEY)
+info     = Info(constants.MAINNET_API_URL, skip_ws=True)
+exchange = Exchange(_wallet, constants.MAINNET_API_URL, account_address=MAIN_ADDR)
 
 
-def sign_request(secret, data):
-    message = json.dumps(data, separators=(',', ':'))
-    return hmac.new(secret.encode(), message.encode(), hashlib.sha256).hexdigest()
-
-
-def safe_post(url, payload, headers=None):
-    """Safe POST — always returns dict, never crashes on bad JSON."""
-    try:
-        if headers:
-            resp = requests.post(url, json=payload, headers=headers, timeout=10)
-        else:
-            resp = requests.post(url, json=payload, timeout=10)
-        print(f"[HTTP] {url} -> status {resp.status_code}")
-        print(f"[HTTP] raw response: {resp.text[:500]}")
-        try:
-            return resp.json()
-        except Exception:
-            print(f"[ERROR] Could not parse JSON from response: {resp.text[:300]}")
-            return {"error": "invalid_json", "raw": resp.text[:300]}
-    except Exception as e:
-        print(f"[ERROR] Request failed: {str(e)}")
-        return {"error": str(e)}
-
-
-def get_eth_price():
-    result = safe_post(f"{HL_BASE_URL}/info", {"type": "allMids"})
-    return float(result.get("ETH", 0))
-
-
-def get_open_position():
-    payload = {"type": "clearinghouseState", "user": HL_WALLET_ADDR}
-    result = safe_post(f"{HL_BASE_URL}/info", payload)
-    if "error" in result:
-        print(f"[ERROR] get_open_position failed: {result}")
-        return None
-    positions = result.get("assetPositions", [])
-    for p in positions:
+# --------------------------- helpers ---------------------------
+def get_equity_and_positions():
+    """Returns (account_value_usd, {coin: signed_size}) for any open positions."""
+    s = info.user_state(MAIN_ADDR)
+    equity = float(s["marginSummary"]["accountValue"])
+    open_coins = {}
+    for p in s.get("assetPositions", []):
         pos = p.get("position", {})
-        if pos.get("coin") == SYMBOL:
-            szi = float(pos.get("szi", 0))
-            if szi != 0:
-                return {
-                    "side": "LONG" if szi > 0 else "SHORT",
-                    "size": abs(szi),
-                    "entry_price": float(pos.get("entryPx", 0))
-                }
-    return None
+        szi = float(pos.get("szi", 0) or 0)
+        if szi != 0:
+            open_coins[pos.get("coin")] = szi
+    return equity, open_coins
 
 
-def get_open_orders():
-    payload = {"type": "openOrders", "user": HL_WALLET_ADDR}
-    return safe_post(f"{HL_BASE_URL}/info", payload)
+def sz_decimals(coin):
+    for a in info.meta()["universe"]:
+        if a["name"] == coin:
+            return int(a["szDecimals"])
+    return 2
 
 
-def cancel_order(order_id):
-    timestamp = get_timestamp()
-    payload = {
-        "action": {
-            "type": "cancel",
-            "cancels": [{"a": 4, "o": order_id}]
-        },
-        "nonce": timestamp,
-        "signature": sign_request(HL_API_SECRET, {"nonce": timestamp})
-    }
-    headers = {"Content-Type": "application/json", "HL-API-KEY": HL_API_KEY}
-    result = safe_post(f"{HL_BASE_URL}/exchange", payload, headers)
-    print(f"[CANCEL] Order {order_id} | Response: {result}")
+def round_px(coin, px):
+    """Round a price to Hyperliquid's valid precision (max 5 significant figures)."""
+    if px <= 0:
+        return px
+    sig = 5 - int(math.floor(math.log10(abs(px)))) - 1
+    max_dec = 6 - sz_decimals(coin)
+    decimals = max(0, min(sig, max_dec))
+    return round(px, decimals)
 
 
-def set_leverage():
-    timestamp = get_timestamp()
-    action = {
-        "type": "updateLeverage",
-        "asset": 4,
-        "isCross": False,
-        "leverage": LEVERAGE
-    }
-    payload = {
-        "action": action,
-        "nonce": timestamp,
-        "signature": sign_request(HL_API_SECRET, {"nonce": timestamp})
-    }
-    headers = {"Content-Type": "application/json", "HL-API-KEY": HL_API_KEY}
-    result = safe_post(f"{HL_BASE_URL}/exchange", payload, headers)
-    print(f"[LEVERAGE] Set to {LEVERAGE}x | Response: {result}")
-    return result
+def decide(d):
+    """Volatility gate first, then the indicators vote. Returns (side, score)."""
+    coin = d["symbol"]
+    if d["atr_pct"] > VOL_LIMITS.get(coin, 2.0):
+        return "NOTHING", 0
+
+    bull = sum([
+        d["ema20"] > d["ema50"],
+        d["ema50"] > d["ema100"],
+        d["macd_hist"] > 0,
+        45 <= d["rsi"] <= 68,
+        d["vol_ratio"] > 1.1,
+    ])
+    bear = sum([
+        d["ema20"] < d["ema50"],
+        d["ema50"] < d["ema100"],
+        d["macd_hist"] < 0,
+        32 <= d["rsi"] <= 55,
+        d["vol_ratio"] > 1.1,
+    ])
+
+    if bull >= SCORE_TO_TRADE and bull > bear:
+        return "LONG", int(bull)
+    if bear >= SCORE_TO_TRADE and bear > bull:
+        return "SHORT", int(bear)
+    return "NOTHING", 0
 
 
-def place_sl_tp(is_buy, size, sl, tp, nonce):
-    sl_order = {
-        "a": 4,
-        "b": not is_buy,
-        "p": str(round(sl, 2)),
-        "s": str(size),
-        "r": True,
-        "t": {
-            "trigger": {
-                "isMarket": True,
-                "tpsl": "sl",
-                "triggerPx": str(round(sl, 2))
-            }
-        }
-    }
-    tp_order = {
-        "a": 4,
-        "b": not is_buy,
-        "p": str(round(tp, 2)),
-        "s": str(size),
-        "r": True,
-        "t": {
-            "trigger": {
-                "isMarket": False,
-                "tpsl": "tp",
-                "triggerPx": str(round(tp, 2))
-            }
-        }
-    }
-    payload = {
-        "action": {
-            "type": "order",
-            "orders": [sl_order, tp_order],
-            "grouping": "normalTpsl"
-        },
-        "nonce": nonce,
-        "signature": sign_request(HL_API_SECRET, {"nonce": nonce})
-    }
-    headers = {"Content-Type": "application/json", "HL-API-KEY": HL_API_KEY}
-    result = safe_post(f"{HL_BASE_URL}/exchange", payload, headers)
-    print(f"[SL/TP] SL=${sl} TP=${tp} | Response: {result}")
+def collateral_for(equity):
+    """Shrinks when the account shrinks; never grows past the starting capital."""
+    base = min(equity, INITIAL_CAPITAL)
+    return round(POSITION_PCT * base, 2)
 
 
-def place_limit_order(side, size_usd, signal_price, sl, tp):
-    is_buy = side == "LONG"
-    eth_size = round(size_usd / signal_price, 4)
-
-    if is_buy:
-        limit_price = round(signal_price * (1 - LIMIT_OFFSET_PCT), 2)
-    else:
-        limit_price = round(signal_price * (1 + LIMIT_OFFSET_PCT), 2)
-
-    print(f"[LIMIT ORDER] {side} {eth_size} ETH @ ${limit_price}")
-
-    lev_result = set_leverage()
-    if "error" in lev_result:
-        print(f"[WARNING] Leverage set failed but continuing: {lev_result}")
-    time.sleep(0.5)
-
-    timestamp = get_timestamp()
-    order = {
-        "a": 4,
-        "b": is_buy,
-        "p": str(limit_price),
-        "s": str(eth_size),
-        "r": False,
-        "t": {"limit": {"tif": "Gtc"}}
-    }
-    payload = {
-        "action": {
-            "type": "order",
-            "orders": [order],
-            "grouping": "na"
-        },
-        "nonce": timestamp,
-        "signature": sign_request(HL_API_SECRET, {"nonce": timestamp})
-    }
-    headers = {"Content-Type": "application/json", "HL-API-KEY": HL_API_KEY}
-    result = safe_post(f"{HL_BASE_URL}/exchange", payload, headers)
-    print(f"[ORDER PLACED] {result}")
-
-    if result.get("status") != "ok":
-        return {
-            "success": False,
-            "result": result,
-            "reason": f"Order failed: {result}"
-        }
-
-    order_id = None
-    try:
-        order_id = result["response"]["data"]["statuses"][0]["resting"]["oid"]
-        print(f"[ORDER ID] {order_id} — waiting up to {FILL_TIMEOUT_SEC}s...")
-    except (KeyError, IndexError):
-        print("[WARNING] Could not extract order ID")
-
-    filled = False
-    waited = 0
-    check_interval = 3
-
-    while waited < FILL_TIMEOUT_SEC:
-        time.sleep(check_interval)
-        waited += check_interval
-        position = get_open_position()
-        if position and position["side"] == side:
-            filled = True
-            print(f"[FILLED] {side} confirmed after {waited}s @ ${position['entry_price']}")
-            break
-        print(f"[WAITING] {waited}s elapsed...")
-
-    if not filled:
-        if order_id:
-            cancel_order(order_id)
-        return {
-            "success": False,
-            "result": result,
-            "reason": f"Not filled within {FILL_TIMEOUT_SEC}s"
-        }
-
-    actual = get_open_position()
-    actual_size = actual["size"] if actual else eth_size
-    place_sl_tp(is_buy, actual_size, sl, tp, get_timestamp())
-
-    return {
-        "success": True,
-        "result": result,
-        "limit_price": limit_price,
-        "filled_after_seconds": waited,
-        "fee_rate": "0.02% maker"
-    }
-
-
-def close_position(side, size):
-    is_buy = side == "SHORT"
-    timestamp = get_timestamp()
-    order = {
-        "a": 4,
-        "b": is_buy,
-        "p": "0",
-        "s": str(size),
-        "r": True,
-        "t": {"limit": {"tif": "Ioc"}}
-    }
-    payload = {
-        "action": {
-            "type": "order",
-            "orders": [order],
-            "grouping": "na"
-        },
-        "nonce": timestamp,
-        "signature": sign_request(HL_API_SECRET, {"nonce": timestamp})
-    }
-    headers = {"Content-Type": "application/json", "HL-API-KEY": HL_API_KEY}
-    result = safe_post(f"{HL_BASE_URL}/exchange", payload, headers)
-    print(f"[CLOSE] {side} closed | Response: {result}")
-
-
-# ---------------------------------------------
-# ROUTES
-# ---------------------------------------------
+# --------------------------- routes ---------------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    data = request.get_json()
-    if not data:
-        return jsonify({"error": "No data received"}), 400
+    raw = request.get_json(force=True, silent=True) or {}
+    body = raw.get("body", raw)   # n8n sometimes nests the payload under "body"
 
-    if data.get("secret") != WEBHOOK_SECRET:
-        return jsonify({"error": "Unauthorized"}), 401
+    if WEBHOOK_SECRET and body.get("secret") != WEBHOOK_SECRET:
+        return jsonify({"status": "error", "reason": "unauthorized"}), 401
 
-    side   = data.get("side", "").upper()
-    symbol = data.get("symbol", "")
-    price  = float(data.get("price", 0))
-    sl     = float(data.get("sl", 0))
-    tp     = float(data.get("tp", 0))
-    atr    = float(data.get("atr", 0))
-    rsi    = float(data.get("rsi", 0))
-    adx    = float(data.get("adx", 0))
+    try:
+        sig = {
+            "symbol":    str(body["symbol"]).upper(),
+            "price":     float(body["price"]),
+            "ema20":     float(body["ema20"]),
+            "ema50":     float(body["ema50"]),
+            "ema100":    float(body["ema100"]),
+            "rsi":       float(body["rsi"]),
+            "macd_hist": float(body["macd_hist"]),
+            "vol_ratio": float(body["vol_ratio"]),
+            "atr_pct":   float(body["atr_pct"]),
+        }
+    except (KeyError, ValueError, TypeError) as e:
+        return jsonify({"status": "error", "reason": f"bad payload: {e}"}), 200
 
-    print(f"\n{'='*50}")
-    print(f"[SIGNAL] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f"  {side} {symbol} @ ${price}")
-    print(f"  SL: ${sl} | TP: ${tp}")
-    print(f"  ATR: {round(atr,2)} | RSI: {round(rsi,1)} | ADX: {round(adx,1)}")
-    print(f"{'='*50}")
+    coin = sig["symbol"]
+    if coin not in COINS:
+        return jsonify({"status": "ignored", "reason": f"{coin} not enabled"}), 200
 
-    if side not in ["LONG", "SHORT"]:
-        return jsonify({"error": f"Invalid side: {side}"}), 400
-    if symbol != SYMBOL:
-        return jsonify({"error": f"Wrong symbol: {symbol}"}), 400
-    if price <= 0 or sl <= 0 or tp <= 0:
-        return jsonify({"error": "Invalid price/sl/tp"}), 400
+    side, score = decide(sig)
+    if side == "NOTHING":
+        return jsonify({"status": "no_trade", "coin": coin,
+                        "reason": "filters not met"}), 200
 
-    existing = get_open_position()
-    if existing:
-        print(f"[SKIP] Already in {existing['side']} — skipping")
-        return jsonify({
-            "status": "skipped",
-            "reason": f"Already in {existing['side']} position",
-            "existing": existing
-        }), 200
+    equity, open_coins = get_equity_and_positions()
+    if coin in open_coins:
+        return jsonify({"status": "skipped", "coin": coin,
+                        "reason": "already in a position on this coin"}), 200
 
-    position_usd = CAPITAL * RISK_PCT
-    print(f"[EXECUTING] {side} ${position_usd} x {LEVERAGE}x = ${position_usd * LEVERAGE} exposure")
+    collateral = collateral_for(equity)
+    price      = sig["price"]
+    notional   = collateral * LEVERAGE
+    size       = round(notional / price, sz_decimals(coin))
+    if size <= 0:
+        return jsonify({"status": "error", "reason": "size rounded to 0 — raise POSITION_PCT"}), 200
 
-    result = place_limit_order(side, position_usd, price, sl, tp)
-
-    if result["success"]:
-        return jsonify({
-            "status": "executed",
-            "order_type": "limit",
-            "fee_rate": "0.02% maker",
-            "side": side,
-            "position_usd": position_usd,
-            "leverage": LEVERAGE,
-            "exposure_usd": position_usd * LEVERAGE,
-            "limit_price": result.get("limit_price"),
-            "sl": sl,
-            "tp": tp,
-            "filled_after_seconds": result.get("filled_after_seconds")
-        }), 200
+    is_buy = side == "LONG"
+    if is_buy:
+        tp = round_px(coin, price * (1 + TP_PCT))
+        sl = round_px(coin, price * (1 - SL_PCT))
     else:
-        return jsonify({
-            "status": "failed",
-            "reason": result.get("reason"),
-            "result": result.get("result")
-        }), 200
+        tp = round_px(coin, price * (1 - TP_PCT))
+        sl = round_px(coin, price * (1 + SL_PCT))
+
+    try:
+        exchange.update_leverage(LEVERAGE, coin, is_cross=False)   # isolated
+        entry = exchange.market_open(coin, is_buy, size, None, SLIPPAGE)
+        # TP and SL as reduce-only trigger orders on the opposite side
+        exchange.order(coin, not is_buy, size, tp,
+                       {"trigger": {"triggerPx": tp, "isMarket": False, "tpsl": "tp"}},
+                       reduce_only=True)
+        exchange.order(coin, not is_buy, size, sl,
+                       {"trigger": {"triggerPx": sl, "isMarket": True, "tpsl": "sl"}},
+                       reduce_only=True)
+    except Exception as e:
+        return jsonify({"status": "error", "coin": coin, "reason": str(e)}), 200
+
+    return jsonify({
+        "status": "executed",
+        "coin": coin,
+        "side": side,
+        "score": score,
+        "entry_price": price,
+        "collateral_usd": collateral,
+        "leverage": LEVERAGE,
+        "exposure_usd": round(notional, 2),
+        "size": size,
+        "tp": tp,
+        "sl": sl,
+        "account_equity": round(equity, 2),
+        "equity_used_for_sizing": round(min(equity, INITIAL_CAPITAL), 2),
+        "time": datetime.utcnow().isoformat()
+    }), 200
 
 
 @app.route("/status", methods=["GET"])
 def status():
-    position = get_open_position()
-    price = get_eth_price()
-    return jsonify({
-        "status": "running",
-        "symbol": SYMBOL,
-        "leverage": f"{LEVERAGE}x",
-        "capital": f"${CAPITAL}",
-        "per_trade": f"${CAPITAL * RISK_PCT}",
-        "exposure_per_trade": f"${CAPITAL * RISK_PCT * LEVERAGE}",
-        "order_type": "limit (maker 0.02%)",
-        "eth_price": f"${price}",
-        "open_position": position,
-        "timestamp": datetime.now().isoformat()
-    })
+    try:
+        equity, open_coins = get_equity_and_positions()
+        return jsonify({
+            "status": "running",
+            "coins": COINS,
+            "leverage": f"{LEVERAGE}x isolated",
+            "initial_capital": INITIAL_CAPITAL,
+            "position_pct": POSITION_PCT,
+            "next_trade_collateral": collateral_for(equity),
+            "account_equity": round(equity, 2),
+            "open_positions": open_coins,
+            "tp_pct": TP_PCT,
+            "sl_pct": SL_PCT,
+        })
+    except Exception as e:
+        return jsonify({"status": "error", "reason": str(e)}), 200
 
 
-@app.route("/close", methods=["POST"])
-def manual_close():
-    position = get_open_position()
-    if not position:
-        return jsonify({"status": "no_open_position"}), 200
-    close_position(position["side"], position["size"])
-    return jsonify({"status": "closed", "was": position})
-
-
-@app.route("/orders", methods=["GET"])
-def open_orders():
-    orders = get_open_orders()
-    return jsonify({"open_orders": orders})
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({"ok": True, "service": "ai-trend-bot"})
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    print(f"\nETH Scalping Bot")
-    print(f"  Symbol:    {SYMBOL}")
-    print(f"  Leverage:  {LEVERAGE}x isolated")
-    print(f"  Per trade: ${CAPITAL * RISK_PCT} (${CAPITAL * RISK_PCT * LEVERAGE} exposure)")
-    print(f"  Orders:    LIMIT at {LIMIT_OFFSET_PCT*100}% offset (maker 0.02%)")
-    print(f"  Timeout:   {FILL_TIMEOUT_SEC}s\n")
-    app.run(host="0.0.0.0", port=port, debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

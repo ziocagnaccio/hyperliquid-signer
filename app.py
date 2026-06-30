@@ -1,7 +1,6 @@
 """
-AI Trend Bot — Hyperliquid (BTC / ETH / SOL)
-Flow:  TradingView (1H indicators) -> n8n -> THIS app -> Hyperliquid
-                                                 \-> Claude rates it -> Telegram
+AI Trend Bot — Hyperliquid (BTC / ETH)
+Flow:  TradingView (1H indicators) -> n8n -> THIS app -> Hyperliquid -> Telegram
 
 What this app does:
   1. Receives the indicators from TradingView (via n8n).
@@ -28,13 +27,13 @@ from hyperliquid.utils import constants
 app = Flask(__name__)
 
 # ========================= CONFIG — edit these =========================
-INITIAL_CAPITAL = 2000.0          # your starting budget, in USD
+INITIAL_CAPITAL = 1000.0          # your starting budget, in USD
 POSITION_PCT    = 0.15            # collateral per trade = 15% of (capped) equity
 LEVERAGE        = 10              # 10x
 TP_PCT          = 0.03            # take profit at +3%
 SL_PCT          = 0.04            # stop loss at -4%
-COINS           = ["BTC", "ETH", "SOL"]
-VOL_LIMITS      = {"BTC": 1.3, "ETH": 1.6, "SOL": 2.0}   # skip if atr_pct above this
+COINS           = ["BTC", "ETH"]
+VOL_LIMITS      = {"BTC": 1.3, "ETH": 1.6}   # skip if atr_pct above this
 SCORE_TO_TRADE  = 3              # need 3 of 5 votes (raise to 4 = stricter)
 SLIPPAGE        = 0.01           # max 1% slippage on the market entry
 # =======================================================================

@@ -10,12 +10,17 @@ What this app does:
         -> shrinks when you're losing, never grows past the start when winning.
   4. Refuses to open a 2nd position on a coin you're already in.
   5. Places a 10x isolated order with TP 3% / SL 4%.
+  6. NEW: detects positions closed by TP/SL since the last hourly check and
+     reports them (with net PnL) so n8n can send a Telegram "closed" message.
+  7. NEW: /report endpoint — a daily dashboard summary (equity, open positions,
+     realized PnL) that n8n can forward to Telegram on a schedule.
 
 Auth: uses the official hyperliquid-python-sdk (correct EIP-712 wallet signing).
 """
 
 import os
 import math
+import time as _time
 from datetime import datetime
 
 from flask import Flask, request, jsonify
@@ -36,6 +41,7 @@ COINS           = ["BTC", "ETH"]
 VOL_LIMITS      = {"BTC": 1.3, "ETH": 1.6}   # skip if atr_pct above this
 SCORE_TO_TRADE  = 3              # need 3 of 5 votes (raise to 4 = stricter)
 SLIPPAGE        = 0.01           # max 1% slippage on the market entry
+CLOSE_LOOKBACK_MIN = 70          # minutes to look back for closed trades
 # =======================================================================
 
 # These come from Render Environment Variables — NEVER put real keys in this file.
@@ -113,6 +119,53 @@ def collateral_for(equity):
     return round(POSITION_PCT * base, 2)
 
 
+def recent_closes(coin, lookback_min=CLOSE_LOOKBACK_MIN):
+    """
+    Looks at the account's recent fills on Hyperliquid and finds any CLOSING
+    fills for this coin within the last `lookback_min` minutes (i.e. a TP or SL
+    that fired since the previous hourly check).
+
+    Returns (closed_count, closed_msg):
+      closed_count = 1 if a close happened, else 0
+      closed_msg   = ready-to-send Telegram text with net PnL (after fees)
+    Stateless by design: no memory needed, safe across Render restarts.
+    """
+    try:
+        fills = info.user_fills(MAIN_ADDR)
+    except Exception:
+        return 0, ""
+
+    cutoff_ms = (_time.time() - lookback_min * 60) * 1000
+    closes = [
+        f for f in fills
+        if f.get("coin") == coin
+        and float(f.get("time", 0)) >= cutoff_ms
+        and str(f.get("dir", "")).startswith("Close")
+    ]
+    if not closes:
+        return 0, ""
+
+    pnl  = sum(float(f.get("closedPnl", 0) or 0) for f in closes)
+    fees = sum(float(f.get("fee", 0) or 0) for f in closes)
+    net  = pnl - fees
+    last_px = closes[-1].get("px", "?")
+    was = str(closes[-1].get("dir", ""))          # e.g. "Close Long"
+    side = "LONG" if "Long" in was else "SHORT"
+
+    emoji = "✅" if net >= 0 else "❌"
+    sign  = "+" if net >= 0 else ""
+    msg = (
+        f"{emoji} {coin} {side} CLOSED @ ${last_px}\n"
+        f"💵 PnL: {sign}{net:.2f}$ (net of fees)"
+    )
+    return 1, msg
+
+
+def _fmt_usd(x):
+    sign = "+" if x >= 0 else ""
+    return f"{sign}{x:.2f}$"
+
+
 # --------------------------- routes ---------------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -135,28 +188,40 @@ def webhook():
             "atr_pct":   float(body["atr_pct"]),
         }
     except (KeyError, ValueError, TypeError) as e:
-        return jsonify({"status": "error", "reason": f"bad payload: {e}"}), 200
+        return jsonify({"status": "error", "reason": f"bad payload: {e}",
+                        "closed_count": 0, "closed_msg": ""}), 200
 
     coin = sig["symbol"]
     if coin not in COINS:
-        return jsonify({"status": "ignored", "reason": f"{coin} not enabled"}), 200
+        return jsonify({"status": "ignored", "reason": f"{coin} not enabled",
+                        "closed_count": 0, "closed_msg": ""}), 200
+
+    # NEW: check if a TP/SL closed this coin's position since the last hour
+    closed_count, closed_msg = recent_closes(coin)
 
     side, score = decide(sig)
     if side == "NOTHING":
         return jsonify({"status": "no_trade", "coin": coin,
-                        "reason": "filters not met"}), 200
+                        "reason": "filters not met",
+                        "closed_count": closed_count,
+                        "closed_msg": closed_msg}), 200
 
     equity, open_coins = get_equity_and_positions()
     if coin in open_coins:
         return jsonify({"status": "skipped", "coin": coin,
-                        "reason": "already in a position on this coin"}), 200
+                        "reason": "already in a position on this coin",
+                        "closed_count": closed_count,
+                        "closed_msg": closed_msg}), 200
 
     collateral = collateral_for(equity)
     price      = sig["price"]
     notional   = collateral * LEVERAGE
     size       = round(notional / price, sz_decimals(coin))
     if size <= 0:
-        return jsonify({"status": "error", "reason": "size rounded to 0 — raise POSITION_PCT"}), 200
+        return jsonify({"status": "error",
+                        "reason": "size rounded to 0 — raise POSITION_PCT",
+                        "closed_count": closed_count,
+                        "closed_msg": closed_msg}), 200
 
     is_buy = side == "LONG"
     if is_buy:
@@ -177,7 +242,9 @@ def webhook():
                        {"trigger": {"triggerPx": sl, "isMarket": True, "tpsl": "sl"}},
                        reduce_only=True)
     except Exception as e:
-        return jsonify({"status": "error", "coin": coin, "reason": str(e)}), 200
+        return jsonify({"status": "error", "coin": coin, "reason": str(e),
+                        "closed_count": closed_count,
+                        "closed_msg": closed_msg}), 200
 
     return jsonify({
         "status": "executed",
@@ -193,8 +260,72 @@ def webhook():
         "sl": sl,
         "account_equity": round(equity, 2),
         "equity_used_for_sizing": round(min(equity, INITIAL_CAPITAL), 2),
+        "closed_count": closed_count,
+        "closed_msg": closed_msg,
         "time": datetime.utcnow().isoformat()
     }), 200
+
+
+@app.route("/report", methods=["GET"])
+def report():
+    """
+    Daily dashboard mirror for Telegram.
+    Returns raw numbers + a ready-made 'report_msg' text that n8n can send as-is.
+    """
+    try:
+        s = info.user_state(MAIN_ADDR)
+        equity = float(s["marginSummary"]["accountValue"])
+
+        # Open positions with unrealized PnL
+        pos_lines = []
+        for p in s.get("assetPositions", []):
+            pos = p.get("position", {})
+            szi = float(pos.get("szi", 0) or 0)
+            if szi == 0:
+                continue
+            coin  = pos.get("coin", "?")
+            side  = "LONG" if szi > 0 else "SHORT"
+            entry = pos.get("entryPx", "?")
+            upnl  = float(pos.get("unrealizedPnl", 0) or 0)
+            pos_lines.append(f"  • {coin} {side} @ ${entry} → {_fmt_usd(upnl)}")
+
+        # Realized PnL over the last 24h (net of fees), from fill history
+        realized_24h = 0.0
+        trades_24h = 0
+        try:
+            cutoff_ms = (_time.time() - 24 * 3600) * 1000
+            for f in info.user_fills(MAIN_ADDR):
+                if float(f.get("time", 0)) >= cutoff_ms and str(f.get("dir", "")).startswith("Close"):
+                    realized_24h += float(f.get("closedPnl", 0) or 0) - float(f.get("fee", 0) or 0)
+                    trades_24h += 1
+        except Exception:
+            pass
+
+        total_pnl = equity - INITIAL_CAPITAL
+
+        lines = [
+            "📊 DAILY REPORT",
+            f"🏦 Equity: ${equity:.2f}",
+            f"📈 Total PnL: {_fmt_usd(total_pnl)} (vs ${INITIAL_CAPITAL:.0f} start)",
+            f"🕐 Last 24h realized: {_fmt_usd(realized_24h)}",
+        ]
+        if pos_lines:
+            lines.append("📌 Open positions:")
+            lines.extend(pos_lines)
+        else:
+            lines.append("📌 Open positions: none")
+        lines.append(f"⏰ {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC")
+
+        return jsonify({
+            "status": "ok",
+            "equity": round(equity, 2),
+            "total_pnl": round(total_pnl, 2),
+            "realized_24h": round(realized_24h, 2),
+            "open_positions_count": len(pos_lines),
+            "report_msg": "\n".join(lines),
+        }), 200
+    except Exception as e:
+        return jsonify({"status": "error", "reason": str(e)}), 200
 
 
 @app.route("/status", methods=["GET"])

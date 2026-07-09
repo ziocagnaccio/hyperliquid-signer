@@ -1,17 +1,13 @@
 """
 AI Trend Bot — Hyperliquid (BTC / ETH)
 Flow:  TradingView (indicators) -> n8n -> THIS app -> Hyperliquid -> Telegram
+Timeframe is set in TradingView, NOT here.
 
-What this app does:
-  1. Receives the indicators from TradingView (via n8n).
-  2. Decides LONG / SHORT / NOTHING  (volatility-gated "indicators vote").
-  3. Sizes the position off your LIVE account value:
-        collateral = POSITION_PCT * min(current_equity, INITIAL_CAPITAL)
-        -> shrinks when you're losing, never grows past the start when winning.
-  4. Refuses to open a 2nd position on a coin you're already in.
-  5. Places a 10x isolated order with TP 4% / SL 3%.
+Exits on a position:
+  - Take profit at +4% (hard ceiling)
+  - Stop loss at -3% (hard floor)
+  - TRAILING take profit: locks in profit if price gives back from its best point
 
-Note: the timeframe (e.g. 3-hour) is set in TradingView, NOT here.
 Auth: uses the official hyperliquid-python-sdk (correct EIP-712 wallet signing).
 """
 
@@ -37,6 +33,10 @@ COINS           = ["BTC", "ETH"]
 VOL_LIMITS      = {"BTC": 1.3, "ETH": 1.6}   # skip if atr_pct above this
 SCORE_TO_TRADE  = 3              # need 3 of 5 votes (raise to 4 = stricter)
 SLIPPAGE        = 0.01           # max 1% slippage on the market entry
+
+# --- Trailing take profit (checked by /manage on a timer) ---
+TRAIL_ACTIVATE  = 0.015          # arm trailing once price moved +1.5% in your favor
+TRAIL_GIVEBACK  = 0.007          # then close if it gives back 0.7% from the best point
 # =======================================================================
 
 # These come from Render Environment Variables — NEVER put real keys in this file.
@@ -47,6 +47,9 @@ WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 _wallet  = Account.from_key(WALLET_KEY)
 info     = Info(constants.MAINNET_API_URL, skip_ws=True)
 exchange = Exchange(_wallet, constants.MAINNET_API_URL, account_address=MAIN_ADDR)
+
+# Remembers the best profit % reached per coin, so trailing can measure the give-back.
+peaks = {}
 
 
 # --------------------------- helpers ---------------------------
@@ -114,6 +117,22 @@ def collateral_for(equity):
     return round(POSITION_PCT * base, 2)
 
 
+def cancel_coin_orders(coin):
+    """Cancel any leftover TP/SL trigger orders for a coin."""
+    try:
+        for o in info.open_orders(MAIN_ADDR):
+            if o.get("coin") == coin:
+                exchange.cancel(coin, o["oid"])
+    except Exception as e:
+        print(f"[cancel] {coin}: {e}")
+
+
+def close_position(coin):
+    """Market-close the position on a coin, then clean up its TP/SL orders."""
+    exchange.market_close(coin)
+    cancel_coin_orders(coin)
+
+
 # --------------------------- routes ---------------------------
 @app.route("/webhook", methods=["POST"])
 def webhook():
@@ -149,8 +168,10 @@ def webhook():
 
     equity, open_coins = get_equity_and_positions()
     if coin in open_coins:
+        # one position per coin — don't stack or flip, just wait for it to close
+        current_side = "LONG" if open_coins[coin] > 0 else "SHORT"
         return jsonify({"status": "skipped", "coin": coin,
-                        "reason": "already in a position on this coin"}), 200
+                        "reason": f"already {current_side} on this coin"}), 200
 
     collateral = collateral_for(equity)
     price      = sig["price"]
@@ -180,6 +201,9 @@ def webhook():
     except Exception as e:
         return jsonify({"status": "error", "coin": coin, "reason": str(e)}), 200
 
+    # fresh position -> reset any old peak so trailing starts clean
+    peaks.pop(coin, None)
+
     return jsonify({
         "status": "executed",
         "coin": coin,
@@ -196,6 +220,64 @@ def webhook():
         "equity_used_for_sizing": round(min(equity, INITIAL_CAPITAL), 2),
         "time": datetime.utcnow().isoformat()
     }), 200
+
+
+@app.route("/manage", methods=["GET"])
+def manage():
+    """Called every few minutes (by UptimeRobot). Runs the trailing take-profit:
+    remembers each position's best profit, and closes it if it gives back too much."""
+    try:
+        s = info.user_state(MAIN_ADDR)
+        mids = info.all_mids()
+        closes = []
+        open_now = set()
+
+        for p in s.get("assetPositions", []):
+            pos = p.get("position", {})
+            szi = float(pos.get("szi", 0) or 0)
+            if szi == 0:
+                continue
+            coin = pos.get("coin")
+            open_now.add(coin)
+            entry = float(pos.get("entryPx", 0) or 0)
+            mark = float(mids.get(coin, 0) or 0)
+            if entry <= 0 or mark <= 0:
+                continue
+
+            # favorable price move (before leverage), matching how TP/SL are defined
+            if szi > 0:            # LONG
+                profit = (mark - entry) / entry
+            else:                  # SHORT
+                profit = (entry - mark) / entry
+
+            peak = max(peaks.get(coin, profit), profit)
+            peaks[coin] = peak
+
+            # armed once it reached the activation level; close if it gives back enough
+            if peak >= TRAIL_ACTIVATE and (peak - profit) >= TRAIL_GIVEBACK:
+                try:
+                    close_position(coin)
+                    peaks.pop(coin, None)
+                    closes.append({
+                        "coin": coin,
+                        "closed_at_pct": round(profit * 100, 2),
+                        "peak_pct": round(peak * 100, 2),
+                    })
+                except Exception as e:
+                    print(f"[trail] close {coin} failed: {e}")
+
+        # forget peaks for coins that are no longer open
+        for c in list(peaks.keys()):
+            if c not in open_now:
+                peaks.pop(c, None)
+
+        return jsonify({
+            "status": "managed",
+            "trailing_closes": closes,
+            "tracked": {k: round(v * 100, 2) for k, v in peaks.items()},
+        }), 200
+    except Exception as e:
+        return jsonify({"status": "error", "reason": str(e)}), 200
 
 
 @app.route("/status", methods=["GET"])

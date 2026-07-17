@@ -3,27 +3,19 @@ AI Trend Bot — Hyperliquid (BTC / ETH / SOL)
 Flow:  TradingView (indicators + S/R) -> n8n -> THIS app -> Hyperliquid -> Telegram
 Timeframe is set in TradingView, NOT here.
 
-Position size is now fixed $ collateral by conviction score, not a % of equity:
-  5/5 votes -> $250, 4/5 -> $200, 3/5 -> $150. Fade trades (see below) -> $200.
+Position size is fixed $ collateral by conviction score:
+  5/5 votes -> $200, 4/5 -> $175, 3/5 -> $150. Fade trades -> $200.
 
 Exits on a position:
   - Take profit at +4% (hard ceiling)
   - Stop loss at -3% (hard floor)
   - TRAILING take profit: locks in profit if price gives back from its best point
 
-Entry guards (NEW):
-  - Cooldown: after a coin's position closes (TP/SL/manual), wait COOLDOWN_HOURS
-    before considering a new entry on that coin.
-  - Re-entry price filter: even after the cooldown, don't re-enter unless price has
-    moved at least REENTRY_ATR_MULT * ATR away from the price where the last
-    position closed. This is what actually blocks re-entries during a sideways
-    market, where time alone would eventually let a bad re-entry through.
-  - Support/Resistance filter: TradingView now sends the nearest pivot-based
-    resistance (above) and support (below). A LONG signal is skipped if price is
-    within SR_ATR_BUFFER * ATR of the resistance above it; a SHORT signal is
-    skipped if price is within that distance of the support below it. Once price
-    closes beyond the level (it breaks), the check naturally stops blocking,
-    so the bot is free to trade the breakout.
+Entry guards:
+  - Cooldown after any close, plus a re-entry price-distance filter.
+  - Support/Resistance filter: skip a LONG if price is within SR_ATR_BUFFER ATRs
+    of the resistance above; skip a SHORT if within that of the support below.
+  - Fade: trade AGAINST a strong, repeatedly-rejected level.
 
 Auth: uses the official hyperliquid-python-sdk (correct EIP-712 wallet signing).
 """
@@ -48,33 +40,24 @@ VOL_LIMITS      = {"BTC": 1.3, "ETH": 1.6, "SOL": 2.0}   # skip if atr_pct above
 SCORE_TO_TRADE  = 3              # need 3 of 5 votes (raise to 4 = stricter)
 SLIPPAGE        = 0.01           # max 1% slippage on the market entry
 
-# --- Position size by conviction score — flat $ collateral, not % of equity ---
-SCORE_COLLATERAL = {3: 150.0, 4: 200.0, 5: 250.0}   # vote score -> collateral in USD
-FADE_COLLATERAL  = 200.0                            # fade trades have no vote score, use mid-size
+# --- Position size by conviction score — flat $ collateral ---
+SCORE_COLLATERAL = {3: 150.0, 4: 175.0, 5: 200.0}   # vote score -> collateral in USD
+FADE_COLLATERAL  = 200.0                            # fade trades have no vote score
 
 # --- Trailing take profit (checked by /manage on a timer) ---
 TRAIL_ACTIVATE  = 0.015          # arm trailing once price moved +1.5% in your favor
 TRAIL_GIVEBACK  = 0.007          # then close if it gives back 0.7% from the best point
 
 # --- Entry guards: cooldown + re-entry distance + support/resistance ---
-# NOTE: the re-entry floor is NOT based on TP_PCT. You don't always exit at +4% —
-# trailing can close as early as ~+0.8%, SL closes at -3%, and manual closes can
-# happen at any price. So this is just a flat "don't treat this as a new
-# opportunity unless price has genuinely moved" floor, independent of how/why
-# the last position closed.
 COOLDOWN_HOURS     = 2           # minimum wait after ANY close before re-entering the coin
-REENTRY_MIN_PCT    = 0.01        # floor: always require at least this % move from the close price (1%)
-REENTRY_ATR_MULT   = 0.75        # ...OR this many ATRs, whichever is BIGGER (scales up in volatile markets)
-SR_ATR_BUFFER      = 0.5         # skip entries within this many ATRs of an opposing S/R level
+REENTRY_MIN_PCT    = 0.01        # floor: require at least this % move from the close price
+REENTRY_ATR_MULT   = 0.75        # ...OR this many ATRs, whichever is BIGGER
+SR_ATR_BUFFER      = 1.5         # skip entries within this many ATRs of an opposing S/R level
 
 # --- Fade a strong level (overrides the trend signal) ---
-# If price sits right at a level that has rejected price SR_STRONG_TOUCHES+ times
-# in the lookback, trade AGAINST the trend signal instead: long off strong
-# support, short off strong resistance. Weaker levels (fewer touches) only
-# block via SR_ATR_BUFFER above — they don't trigger a fade.
-SR_STRONG_TOUCHES    = 2         # min touches/rejections for a level to be "strong" enough to fade
-SR_FADE_ATR_MULT     = 0.5       # how close (in ATRs) price must be to the strong level to fade it
-SR_FADE_SL_ATR_MULT  = 0.3       # stop placed this many ATRs beyond the level (buffer against noise)
+SR_STRONG_TOUCHES    = 2         # min touches for a level to be "strong" enough to fade
+SR_FADE_ATR_MULT     = 1.0       # how close (in ATRs) price must be to the strong level to fade
+SR_FADE_SL_ATR_MULT  = 0.3       # stop placed this many ATRs beyond the level
 # =======================================================================
 
 # These come from Render Environment Variables — NEVER put real keys in this file.
@@ -89,12 +72,10 @@ exchange = Exchange(_wallet, constants.MAINNET_API_URL, account_address=MAIN_ADD
 # Remembers the best profit % reached per coin, so trailing can measure the give-back.
 peaks = {}
 
-# Remembers the last seen open side per coin, so we can detect "it just closed"
-# (whether closed by TP, SL, trailing, or manually on Hyperliquid itself).
+# Remembers the last seen open side per coin, so we can detect "it just closed".
 known_open = {}
 
-# Remembers, per coin, the price/time of the most recent close — used by the
-# cooldown + re-entry distance guard.
+# Remembers, per coin, the price/time of the most recent close.
 last_close = {}
 
 # --------------------------- helpers ---------------------------
@@ -113,10 +94,9 @@ def get_equity_and_positions():
 
 
 def update_close_tracking(open_coins):
-    """Compare currently open coins to what we last saw open. Any coin that
-    was open before and isn't now just closed — record its close price/time
-    so the cooldown + re-entry filter can use it. Works whether the close was
-    our TP/SL trigger, trailing stop, or a manual close on Hyperliquid."""
+    """Any coin that was open before and isn't now just closed — record its
+    close price/time for the cooldown + re-entry filter. Works whether the close
+    was TP/SL, trailing, or a manual close on Hyperliquid."""
     global known_open
     mids = None
     for coin in COINS:
@@ -145,8 +125,8 @@ def blocked_by_cooldown_or_price(coin, price, atr_pct):
     if hours_since < COOLDOWN_HOURS:
         return f"cooldown active ({hours_since:.2f}h < {COOLDOWN_HOURS}h since last close)"
     atr_abs = (atr_pct / 100.0) * price
-    min_move_pct = REENTRY_MIN_PCT * price     # floor tied to the TP target
-    min_move_atr = REENTRY_ATR_MULT * atr_abs  # scales up with volatility
+    min_move_pct = REENTRY_MIN_PCT * price
+    min_move_atr = REENTRY_ATR_MULT * atr_abs
     required_move = max(min_move_pct, min_move_atr)
     moved = abs(price - lc["price"])
     if moved < required_move:
@@ -157,9 +137,8 @@ def blocked_by_cooldown_or_price(coin, price, atr_pct):
 
 
 def blocked_by_level(side, price, atr_pct, resistance, support):
-    """Returns a reason string if entry should be skipped because price is too
-    close to an opposing support/resistance level, else None. If the level has
-    already been broken (price past it), this does NOT block — breakouts are
+    """Skip an entry if price is too close to an opposing S/R level. If the level
+    has already been broken (price past it), this does NOT block — breakouts are
     allowed through."""
     atr_abs = (atr_pct / 100.0) * price
     if atr_abs <= 0:
@@ -175,12 +154,9 @@ def blocked_by_level(side, price, atr_pct, resistance, support):
 
 def plan_fade_trade(coin, price, atr_pct, resistance, res_touches, support, sup_touches):
     """If price is right at a level that has rejected price SR_STRONG_TOUCHES+
-    times, plan a trade AGAINST that level — long off strong support, short off
-    strong resistance — regardless of what the 3H trend signal says. Stop goes
-    just beyond the level (capped at the normal SL_PCT so risk never exceeds a
-    regular trade); target is the opposite level if it's closer than the
-    normal TP_PCT, else the normal TP_PCT. Returns None if no strong level is
-    close enough right now."""
+    times, plan a trade AGAINST that level. Stop goes just beyond the level
+    (capped at the normal SL_PCT); target is the opposite level if closer than
+    the normal TP_PCT."""
     atr_abs = (atr_pct / 100.0) * price
     if atr_abs <= 0:
         return None
@@ -252,10 +228,7 @@ def decide(d):
 
 
 def collateral_for(equity, score=None):
-    """Fixed collateral by conviction score: 5/5 -> $250, 4/5 -> $200, 3/5 -> $150.
-    Fade trades (no vote score) use FADE_COLLATERAL. Capped at 95% of current
-    equity so it never asks for more collateral than the account actually has,
-    even if equity has dropped below the score's usual size."""
+    """Fixed collateral by conviction score. Capped at 95% of current equity."""
     base = SCORE_COLLATERAL.get(score, FADE_COLLATERAL)
     return round(min(base, equity * 0.95), 2)
 
@@ -316,8 +289,7 @@ def webhook():
 
     price = sig["price"]
 
-    # 1) A strong, repeatedly-rejected level takes priority over the trend
-    #    signal — fade it (long off strong support, short off strong resistance).
+    # 1) A strong, repeatedly-rejected level takes priority over the trend signal
     fade = plan_fade_trade(coin, price, sig["atr_pct"],
                            sig["resistance"], sig["res_touches"],
                            sig["support"], sig["sup_touches"])
@@ -348,7 +320,7 @@ def webhook():
 
     if trade_type == "trend":
         # only trend-follow trades get blocked by proximity to a level — a fade
-        # trade is specifically ABOUT trading at the level, so this doesn't apply
+        # trade is specifically ABOUT trading at the level
         level_reason = blocked_by_level(side, price, sig["atr_pct"], sig["resistance"], sig["support"])
         if level_reason:
             return jsonify({"status": "skipped", "coin": coin, "reason": level_reason}), 200
@@ -357,7 +329,7 @@ def webhook():
     notional   = collateral * LEVERAGE
     size       = round(notional / price, sz_decimals(coin))
     if size <= 0:
-        return jsonify({"status": "error", "reason": "size rounded to 0 — raise POSITION_PCT"}), 200
+        return jsonify({"status": "error", "reason": "size rounded to 0 — collateral too small"}), 200
 
     is_buy = side == "LONG"
     if trade_type == "fade":
@@ -405,17 +377,15 @@ def webhook():
         "resistance": sig["resistance"],
         "support": sig["support"],
         "account_equity": round(equity, 2),
-        "equity_used_for_sizing": round(min(equity, INITIAL_CAPITAL), 2),
         "time": datetime.utcnow().isoformat()
     }), 200
 
 
 @app.route("/manage", methods=["GET"])
 def manage():
-    """Called every few minutes (by UptimeRobot). Runs the trailing take-profit:
-    remembers each position's best profit, and closes it if it gives back too much.
-    Also updates close-tracking so the cooldown/re-entry guard sees closes that
-    happen via TP/SL triggers or a manual close on Hyperliquid itself."""
+    """Called every few minutes (by UptimeRobot). Runs the trailing take-profit
+    and updates close-tracking so the cooldown/re-entry guard sees TP/SL and
+    manual closes."""
     try:
         s = info.user_state(MAIN_ADDR)
         mids = info.all_mids()

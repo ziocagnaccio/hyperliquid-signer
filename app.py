@@ -1,17 +1,18 @@
 """
-AI Trend Bot — Hyperliquid (BTC / ETH / SOL)
-Flow:  TradingView (indicators + S/R) -> n8n -> THIS app -> Hyperliquid -> Telegram
+AI Trend Bot — Hyperliquid (BTC / ETH) — CLEAN VERSION
+Flow:  TradingView (indicators) -> n8n -> THIS app -> Hyperliquid -> Telegram
 Timeframe is set in TradingView, NOT here.
 
-FIX in this version: the entry now WAITS until the position is confirmed filled
-before attaching TP/SL, and clears any leftover orders first. This stops the
-"canceled due to reduce-only" problem that was closing positions early.
+Pure trend-following (no support/resistance, no fade). Back to what worked,
+with the reduce-only bug fixed.
 
-Position size by conviction score: 5/5 -> $200, 4/5 -> $175, 3/5 -> $150. Fade -> $200.
-Exits: TP +4% | SL -3% | trailing take profit.
-Entry guards: cooldown + re-entry distance + support/resistance + fade.
+Size:   base $200 collateral; a full 5/5 score gets $250.
+Exits:  TP +4% | SL -3% | TRAILING take profit (locks profit on a give-back).
+Guard:  cooldown + re-entry distance (won't reopen right where it just closed).
+Fix:    waits for the entry to confirm filled before attaching TP/SL, and clears
+        any leftover orders first -> no more "canceled due to reduce-only".
 
-Auth: uses the official hyperliquid-python-sdk (correct EIP-712 wallet signing).
+Auth: official hyperliquid-python-sdk (EIP-712 wallet signing).
 """
 import os
 import time
@@ -28,31 +29,28 @@ app = Flask(__name__)
 # ========================= CONFIG — edit these =========================
 INITIAL_CAPITAL = 1000.0
 LEVERAGE        = 10
-TP_PCT          = 0.04
-SL_PCT          = 0.03
-COINS           = ["BTC", "ETH", "SOL"]
-VOL_LIMITS      = {"BTC": 1.3, "ETH": 1.6, "SOL": 2.0}
-SCORE_TO_TRADE  = 3
+TP_PCT          = 0.04            # take profit +4%
+SL_PCT          = 0.03            # stop loss  -3%
+COINS           = ["BTC", "ETH"]
+VOL_LIMITS      = {"BTC": 1.3, "ETH": 1.6}   # skip if atr_pct above this
+SCORE_TO_TRADE  = 3              # need 3 of 5 votes
 SLIPPAGE        = 0.01
 
-SCORE_COLLATERAL = {3: 150.0, 4: 175.0, 5: 200.0}
-FADE_COLLATERAL  = 200.0
+# --- Position size by conviction score (flat $ collateral) ---
+SCORE_COLLATERAL = {3: 200.0, 4: 200.0, 5: 250.0}   # 5/5 -> 250, otherwise 200
 
-TRAIL_ACTIVATE  = 0.015
-TRAIL_GIVEBACK  = 0.007
+# --- Trailing take profit (checked by /manage on a timer) ---
+TRAIL_ACTIVATE  = 0.015          # arm once price moved +1.5% in your favor
+TRAIL_GIVEBACK  = 0.007          # close if it gives back 0.7% from the best point
 
-COOLDOWN_HOURS     = 2
-REENTRY_MIN_PCT    = 0.01
-REENTRY_ATR_MULT   = 0.75
-SR_ATR_BUFFER      = 1.5
+# --- Re-entry guard: don't reopen right where you just closed ---
+COOLDOWN_HOURS   = 2             # wait after any close before re-entering the coin
+REENTRY_MIN_PCT  = 0.01          # require at least this % move from the close price
+REENTRY_ATR_MULT = 0.75          # ...or this many ATRs, whichever is BIGGER
 
-SR_STRONG_TOUCHES    = 2
-SR_FADE_ATR_MULT     = 1.0
-SR_FADE_SL_ATR_MULT  = 0.3
-
-# how long to wait for the entry to confirm filled before attaching TP/SL
-FILL_WAIT_TRIES     = 12     # number of checks
-FILL_WAIT_SECONDS   = 0.5    # pause between checks (12 x 0.5s = up to 6s)
+# --- Fill confirmation (the bug fix) ---
+FILL_WAIT_TRIES   = 12           # checks after opening
+FILL_WAIT_SECONDS = 0.5          # pause between checks (up to ~6s total)
 # =======================================================================
 
 WALLET_KEY     = os.environ["HL_PRIVATE_KEY"]
@@ -63,9 +61,9 @@ _wallet  = Account.from_key(WALLET_KEY)
 info     = Info(constants.MAINNET_API_URL, skip_ws=True)
 exchange = Exchange(_wallet, constants.MAINNET_API_URL, account_address=MAIN_ADDR)
 
-peaks = {}
-known_open = {}
-last_close = {}
+peaks = {}          # best profit % per coin (trailing)
+known_open = {}     # last seen open side per coin (to detect closes)
+last_close = {}     # price/time of the most recent close per coin
 
 # --------------------------- helpers ---------------------------
 
@@ -82,12 +80,12 @@ def get_equity_and_positions():
 
 
 def update_close_tracking(open_coins):
+    """Records the price/time when a coin's position disappears (closed by
+    TP/SL, trailing, or manually), so the re-entry guard can use it."""
     global known_open
     mids = None
     for coin in COINS:
-        was_open = coin in known_open
-        is_open = coin in open_coins
-        if was_open and not is_open:
+        if coin in known_open and coin not in open_coins:
             try:
                 mids = mids if mids is not None else info.all_mids()
                 px = float(mids.get(coin, 0) or 0)
@@ -109,40 +107,7 @@ def blocked_by_cooldown_or_price(coin, price, atr_pct):
     moved = abs(price - lc["price"])
     if moved < required_move:
         return (f"price hasn't moved enough since last close "
-                f"({moved:.2f} < required {required_move:.2f}, "
-                f"= max({REENTRY_MIN_PCT*100:.1f}% of price, {REENTRY_ATR_MULT}xATR))")
-    return None
-
-
-def blocked_by_level(side, price, atr_pct, resistance, support):
-    atr_abs = (atr_pct / 100.0) * price
-    if atr_abs <= 0:
-        return None
-    if side == "LONG" and resistance and resistance > 0 and price < resistance:
-        if (resistance - price) < SR_ATR_BUFFER * atr_abs:
-            return f"too close to resistance {resistance} (within {SR_ATR_BUFFER}xATR)"
-    if side == "SHORT" and support and support > 0 and price > support:
-        if (price - support) < SR_ATR_BUFFER * atr_abs:
-            return f"too close to support {support} (within {SR_ATR_BUFFER}xATR)"
-    return None
-
-
-def plan_fade_trade(coin, price, atr_pct, resistance, res_touches, support, sup_touches):
-    atr_abs = (atr_pct / 100.0) * price
-    if atr_abs <= 0:
-        return None
-    if support and support > 0 and sup_touches >= SR_STRONG_TOUCHES and price > support:
-        if (price - support) < SR_FADE_ATR_MULT * atr_abs:
-            sl = support - SR_FADE_SL_ATR_MULT * atr_abs
-            sl = max(sl, price * (1 - SL_PCT))
-            tp = min(resistance, price * (1 + TP_PCT)) if (resistance and resistance > price) else price * (1 + TP_PCT)
-            return {"side": "LONG", "sl": sl, "tp": tp, "touches": sup_touches, "level": support}
-    if resistance and resistance > 0 and res_touches >= SR_STRONG_TOUCHES and price < resistance:
-        if (resistance - price) < SR_FADE_ATR_MULT * atr_abs:
-            sl = resistance + SR_FADE_SL_ATR_MULT * atr_abs
-            sl = min(sl, price * (1 + SL_PCT))
-            tp = max(support, price * (1 - TP_PCT)) if (support and support < price) else price * (1 - TP_PCT)
-            return {"side": "SHORT", "sl": sl, "tp": tp, "touches": res_touches, "level": resistance}
+                f"({moved:.2f} < required {required_move:.2f})")
     return None
 
 
@@ -181,8 +146,8 @@ def decide(d):
     return "NOTHING", 0
 
 
-def collateral_for(equity, score=None):
-    base = SCORE_COLLATERAL.get(score, FADE_COLLATERAL)
+def collateral_for(equity, score):
+    base = SCORE_COLLATERAL.get(score, 200.0)
     return round(min(base, equity * 0.95), 2)
 
 
@@ -202,8 +167,6 @@ def close_position(coin):
 
 
 def wait_for_fill(coin, side):
-    """Poll until the position actually exists on the correct side. Returns the
-    filled size (absolute), or 0 if it never confirmed."""
     want_long = side == "LONG"
     for _ in range(FILL_WAIT_TRIES):
         time.sleep(FILL_WAIT_SECONDS)
@@ -230,10 +193,6 @@ def webhook():
             "ema20": float(body["ema20"]), "ema50": float(body["ema50"]), "ema100": float(body["ema100"]),
             "rsi": float(body["rsi"]), "macd_hist": float(body["macd_hist"]),
             "vol_ratio": float(body["vol_ratio"]), "atr_pct": float(body["atr_pct"]),
-            "resistance": float(body.get("resistance", 0) or 0),
-            "support": float(body.get("support", 0) or 0),
-            "res_touches": int(float(body.get("res_touches", 0) or 0)),
-            "sup_touches": int(float(body.get("sup_touches", 0) or 0)),
         }
     except (KeyError, ValueError, TypeError) as e:
         return jsonify({"status": "error", "reason": f"bad payload: {e}"}), 200
@@ -241,19 +200,10 @@ def webhook():
     coin = sig["symbol"]
     if coin not in COINS:
         return jsonify({"status": "ignored", "reason": f"{coin} not enabled"}), 200
-    if sig["atr_pct"] > VOL_LIMITS.get(coin, 2.0):
-        return jsonify({"status": "no_trade", "coin": coin, "reason": "volatility too high"}), 200
 
-    price = sig["price"]
-    fade = plan_fade_trade(coin, price, sig["atr_pct"], sig["resistance"], sig["res_touches"],
-                           sig["support"], sig["sup_touches"])
-    if fade:
-        side, score, trade_type = fade["side"], None, "fade"
-    else:
-        side, score = decide(sig)
-        if side == "NOTHING":
-            return jsonify({"status": "no_trade", "coin": coin, "reason": "filters not met"}), 200
-        trade_type = "trend"
+    side, score = decide(sig)
+    if side == "NOTHING":
+        return jsonify({"status": "no_trade", "coin": coin, "reason": "filters not met"}), 200
 
     equity, open_coins = get_equity_and_positions()
     update_close_tracking(open_coins)
@@ -263,42 +213,31 @@ def webhook():
         return jsonify({"status": "skipped", "coin": coin,
                         "reason": f"already {current_side} on this coin"}), 200
 
-    guard_reason = blocked_by_cooldown_or_price(coin, price, sig["atr_pct"])
-    if guard_reason:
-        return jsonify({"status": "skipped", "coin": coin, "reason": guard_reason}), 200
+    guard = blocked_by_cooldown_or_price(coin, sig["price"], sig["atr_pct"])
+    if guard:
+        return jsonify({"status": "skipped", "coin": coin, "reason": guard}), 200
 
-    if trade_type == "trend":
-        level_reason = blocked_by_level(side, price, sig["atr_pct"], sig["resistance"], sig["support"])
-        if level_reason:
-            return jsonify({"status": "skipped", "coin": coin, "reason": level_reason}), 200
-
+    price      = sig["price"]
     collateral = collateral_for(equity, score)
     notional   = collateral * LEVERAGE
     size       = round(notional / price, sz_decimals(coin))
     if size <= 0:
-        return jsonify({"status": "error", "reason": "size rounded to 0 — collateral too small"}), 200
+        return jsonify({"status": "error", "reason": "size rounded to 0"}), 200
 
     is_buy = side == "LONG"
-    if trade_type == "fade":
-        tp, sl = round_px(coin, fade["tp"]), round_px(coin, fade["sl"])
-    elif is_buy:
+    if is_buy:
         tp, sl = round_px(coin, price * (1 + TP_PCT)), round_px(coin, price * (1 - SL_PCT))
     else:
         tp, sl = round_px(coin, price * (1 - TP_PCT)), round_px(coin, price * (1 + SL_PCT))
 
     try:
-        # 1) clear any leftover orders on this coin (e.g. from a manual close)
-        cancel_coin_orders(coin)
-        # 2) set leverage and open
-        exchange.update_leverage(LEVERAGE, coin, is_cross=False)
-        exchange.market_open(coin, is_buy, size, None, SLIPPAGE)
-        # 3) WAIT until the position is really open before attaching TP/SL,
-        #    otherwise Hyperliquid cancels the reduce-only orders
-        filled = wait_for_fill(coin, side)
+        cancel_coin_orders(coin)                                   # clear leftovers
+        exchange.update_leverage(LEVERAGE, coin, is_cross=False)   # isolated
+        exchange.market_open(coin, is_buy, size, None, SLIPPAGE)   # open
+        filled = wait_for_fill(coin, side)                         # WAIT for the fill
         if filled <= 0:
             return jsonify({"status": "error", "coin": coin,
                             "reason": "entry not confirmed filled — no TP/SL attached"}), 200
-        # 4) attach TP/SL against the ACTUAL filled size
         exchange.order(coin, not is_buy, filled, tp,
                        {"trigger": {"triggerPx": tp, "isMarket": False, "tpsl": "tp"}}, reduce_only=True)
         exchange.order(coin, not is_buy, filled, sl,
@@ -310,11 +249,9 @@ def webhook():
     known_open[coin] = side
 
     return jsonify({
-        "status": "executed", "coin": coin, "side": side, "trade_type": trade_type, "score": score,
-        "fade_level": fade["level"] if fade else None, "fade_touches": fade["touches"] if fade else None,
+        "status": "executed", "coin": coin, "side": side, "score": score,
         "entry_price": price, "collateral_usd": collateral, "leverage": LEVERAGE,
         "exposure_usd": round(notional, 2), "size": filled, "tp": tp, "sl": sl,
-        "resistance": sig["resistance"], "support": sig["support"],
         "account_equity": round(equity, 2), "time": datetime.utcnow().isoformat()
     }), 200
 
@@ -371,10 +308,9 @@ def status():
         return jsonify({
             "status": "running", "coins": COINS, "leverage": f"{LEVERAGE}x isolated",
             "initial_capital": INITIAL_CAPITAL, "score_collateral": SCORE_COLLATERAL,
-            "fade_collateral": FADE_COLLATERAL, "account_equity": round(equity, 2),
-            "open_positions": open_coins, "tp_pct": TP_PCT, "sl_pct": SL_PCT,
-            "cooldown_hours": COOLDOWN_HOURS, "reentry_atr_mult": REENTRY_ATR_MULT,
-            "sr_atr_buffer": SR_ATR_BUFFER, "sr_strong_touches": SR_STRONG_TOUCHES,
+            "account_equity": round(equity, 2), "open_positions": open_coins,
+            "tp_pct": TP_PCT, "sl_pct": SL_PCT, "cooldown_hours": COOLDOWN_HOURS,
+            "reentry_atr_mult": REENTRY_ATR_MULT,
             "last_close": {c: {"price": v["price"], "side": v["side"], "time": v["time"].isoformat()}
                            for c, v in last_close.items()},
         })
@@ -384,7 +320,7 @@ def status():
 
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({"ok": True, "service": "ai-trend-bot"})
+    return jsonify({"ok": True, "service": "ai-trend-bot-clean"})
 
 
 if __name__ == "__main__":

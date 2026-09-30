@@ -1,12 +1,11 @@
 """
-AI Trend Bot — Hyperliquid (BTC / ETH) — CLEAN VERSION
+AI Trend Bot — Hyperliquid (BTC / ETH) — CLEAN VERSION — BOT A ($480 wallet)
 Flow:  TradingView (indicators) -> n8n -> THIS app -> Hyperliquid -> Telegram
 Timeframe is set in TradingView, NOT here.
 
-Pure trend-following (no support/resistance, no fade). Back to what worked,
-with the reduce-only bug fixed.
+Pure trend-following (no support/resistance, no fade).
 
-Size:   base $200 collateral; a full 5/5 score gets $250.
+Size:   base $100 collateral; a full 5/5 score gets $150.
 Exits:  TP +4% | SL -3% | TRAILING take profit (locks profit on a give-back).
 Guard:  cooldown + re-entry distance (won't reopen right where it just closed).
 Fix:    waits for the entry to confirm filled before attaching TP/SL, and clears
@@ -27,7 +26,7 @@ from hyperliquid.utils import constants
 app = Flask(__name__)
 
 # ========================= CONFIG — edit these =========================
-INITIAL_CAPITAL = 1000.0
+INITIAL_CAPITAL = 480.0
 LEVERAGE        = 10
 TP_PCT          = 0.04            # take profit +4%
 SL_PCT          = 0.03            # stop loss  -3%
@@ -37,7 +36,7 @@ SCORE_TO_TRADE  = 3              # need 3 of 5 votes
 SLIPPAGE        = 0.01
 
 # --- Position size by conviction score (flat $ collateral) ---
-SCORE_COLLATERAL = {3: 200.0, 4: 200.0, 5: 250.0}   # 5/5 -> 250, otherwise 200
+SCORE_COLLATERAL = {3: 100.0, 4: 100.0, 5: 150.0}   # 5/5 -> 150, otherwise 100
 
 # --- Trailing take profit (checked by /manage on a timer) ---
 TRAIL_ACTIVATE  = 0.015          # arm once price moved +1.5% in your favor
@@ -147,7 +146,7 @@ def decide(d):
 
 
 def collateral_for(equity, score):
-    base = SCORE_COLLATERAL.get(score, 200.0)
+    base = SCORE_COLLATERAL.get(score, 100.0)
     return round(min(base, equity * 0.95), 2)
 
 
@@ -306,7 +305,8 @@ def status():
     try:
         equity, open_coins = get_equity_and_positions()
         return jsonify({
-            "status": "running", "coins": COINS, "leverage": f"{LEVERAGE}x isolated",
+            "status": "running", "bot": "A (current strategy)", "coins": COINS,
+            "leverage": f"{LEVERAGE}x isolated",
             "initial_capital": INITIAL_CAPITAL, "score_collateral": SCORE_COLLATERAL,
             "account_equity": round(equity, 2), "open_positions": open_coins,
             "tp_pct": TP_PCT, "sl_pct": SL_PCT, "cooldown_hours": COOLDOWN_HOURS,
@@ -320,7 +320,7 @@ def status():
 
 @app.route("/", methods=["GET"])
 def home():
-    return jsonify({"ok": True, "service": "ai-trend-bot-clean"})
+    return jsonify({"ok": True, "service": "ai-trend-bot-clean-A"})
 
 
 if __name__ == "__main__":

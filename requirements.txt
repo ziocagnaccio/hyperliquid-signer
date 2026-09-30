@@ -1,3 +1,5 @@
 flask
-hyperliquid-python-sdk
+gunicorn
+requests
 eth-account
+hyperliquid-python-sdk
